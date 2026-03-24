@@ -14,7 +14,7 @@
 
 #include <Eigen/Dense>
 #include <Eigen/QR>
-#include <armadillo>
+#include <RcppArmadillo.h>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
