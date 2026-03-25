@@ -1,29 +1,33 @@
-# saige-build mamba env — has all required libs (armadillo, superlu, tbb, yaml-cpp, R, RcppParallel)
-SAIGE_BUILD  := /data/home/seokhojeong/.local/share/mamba/envs/saige-build
-CXX          := $(SAIGE_BUILD)/bin/x86_64-conda-linux-gnu-c++
-CXXFLAGS     ?= -std=c++17 -O2 -DARMA_64BIT_WORD=1 -DRCPP_PARALLEL_USE_TBB=0 -MMD -MP -pthread
+# Platform detection
+UNAME_S := $(shell uname -s)
 
-# Also used for fallback include/lib probing
-CONDA_BASE   ?= /data/home/seokhojeong/anaconda3
-# Active conda env (may differ; saige-build takes priority)
-CONDA_PREFIX ?= $(shell echo $$CONDA_PREFIX)
+ifeq ($(UNAME_S),Darwin)
+  CXX ?= clang++
+else
+  CXX ?= g++
+endif
 
-RSCRIPT    := $(shell command -v Rscript 2>/dev/null)
-PKG_CONFIG := $(shell command -v pkg-config 2>/dev/null)
+CXXFLAGS ?= -std=c++17 -O2 -DARMA_64BIT_WORD=1 -DRCPP_PARALLEL_USE_TBB=0 -MMD -MP -pthread
+
+RSCRIPT      := $(shell command -v Rscript 2>/dev/null)
+PKG_CONFIG   := $(shell command -v pkg-config 2>/dev/null)
 
 # -------------------------
-# Optional R / Rcpp includes and libs
+# R / Rcpp includes (auto-detect via Rscript if available)
 # -------------------------
-# Use R from saige-build env directly (avoids active-env CXX override issues)
-SAIGE_RSCRIPT   := $(SAIGE_BUILD)/bin/Rscript
-SAIGE_RLIB      := $(SAIGE_BUILD)/lib/R/library
-R_HOME          := $(SAIGE_BUILD)/lib/R
-RCPP_INC        := $(SAIGE_RLIB)/Rcpp/include
-RCPPARM_INC     := $(SAIGE_RLIB)/RcppArmadillo/include
-RCPPARAL_INC    := $(SAIGE_RLIB)/RcppParallel/include
-RCPPEIG_INC     :=
-RCPPARAL_LIBDIR := $(SAIGE_RLIB)/RcppParallel/libs
-RCPPARAL_SO     := $(shell ls "$(RCPPARAL_LIBDIR)/RcppParallel.so" 2>/dev/null)
+ifeq ($(strip $(RSCRIPT)),)
+  R_HOME       :=
+  RCPP_INC     :=
+  RCPPARM_INC  :=
+  RCPPARAL_INC :=
+  RCPPEIG_INC  :=
+else
+  R_HOME       := $(shell "$(RSCRIPT)" -e 'cat(R.home())')
+  RCPP_INC     := $(shell "$(RSCRIPT)" -e 'cat(system.file("include", package="Rcpp"))')
+  RCPPARM_INC  := $(shell "$(RSCRIPT)" -e 'cat(system.file("include", package="RcppArmadillo"))')
+  RCPPARAL_INC := $(shell "$(RSCRIPT)" -e 'cat(system.file("include", package="RcppParallel"))')
+  RCPPEIG_INC  := $(shell "$(RSCRIPT)" -e 'cat(system.file("include", package="RcppEigen"))')
+endif
 
 # -------------------------
 # pkg-config (Armadillo / yaml-cpp)
@@ -43,16 +47,21 @@ endif
 # -------------------------
 # Include paths
 # -------------------------
-# Local directory first (picks up cxxopts.hpp bundled alongside sources)
-INCLUDES := -I. -I/usr/local/include
-
-# saige-build env (all required headers including yaml-cpp, armadillo, eigen3, RcppParallel)
-INCLUDES += -isystem $(SAIGE_BUILD)/include
-INCLUDES += -I$(SAIGE_BUILD)/include
-INCLUDES += -I$(SAIGE_BUILD)/include/eigen3
-
-# System fallback
-INCLUDES += -I/usr/include/eigen3
+ifeq ($(UNAME_S),Darwin)
+  INCLUDES := -I. -I/usr/local/include \
+              -I/opt/homebrew/opt/boost/include \
+              -I/opt/homebrew/include \
+              -I/opt/homebrew/opt/eigen/include/eigen3
+else
+  INCLUDES := -I. -I/usr/local/include \
+              -I/usr/include/eigen3
+  # Conda/mamba env (if active, add its include paths)
+  ifneq ($(strip $(CONDA_PREFIX)),)
+    INCLUDES += -isystem $(CONDA_PREFIX)/include \
+                -I$(CONDA_PREFIX)/include \
+                -I$(CONDA_PREFIX)/include/eigen3
+  endif
+endif
 
 # Optional R headers
 ifneq ($(strip $(R_HOME)),)
@@ -82,16 +91,30 @@ endif
 # -------------------------
 # Libraries / linker flags
 # -------------------------
-LIBS := -pthread
+ifeq ($(UNAME_S),Darwin)
+  LIBS := -lyaml-cpp \
+          -larmadillo \
+          -L/opt/homebrew/opt/openblas/lib -lopenblas \
+          -llapack \
+          -L/opt/homebrew/opt/superlu/lib -lsuperlu \
+          -L/opt/homebrew/opt/tbb/lib -ltbb
+else
+  LIBS := -pthread \
+          -lyaml-cpp \
+          -larmadillo \
+          -lopenblas \
+          -llapack \
+          -lsuperlu \
+          -ltbb
+  # Conda/mamba env (if active, add its library paths)
+  ifneq ($(strip $(CONDA_PREFIX)),)
+    LIBS := -pthread \
+            -L$(CONDA_PREFIX)/lib -Wl,-rpath,$(CONDA_PREFIX)/lib \
+            -lyaml-cpp -larmadillo -lopenblas -llapack -lsuperlu -ltbb
+  endif
+endif
 
-# saige-build env libs (has everything: yaml-cpp, armadillo, superlu, tbb, R, RcppParallel)
-LIBS += -L$(SAIGE_BUILD)/lib
-LIBS += -Wl,-rpath,$(SAIGE_BUILD)/lib
-
-# Core libs
-LIBS += -lyaml-cpp -larmadillo -lopenblas -llapack -lsuperlu -ltbb
-
-# pkg-config libs (can duplicate; usually harmless)
+# pkg-config libs
 ifneq ($(strip $(YAML_LIBS)),)
   LIBS += $(YAML_LIBS)
 endif
@@ -105,7 +128,9 @@ ifneq ($(strip $(R_HOME)),)
   LIBS += -Wl,-rpath,"$(R_HOME)/lib"
 endif
 
-# Optional RcppParallel runtime (link actual .so directly for reliability)
+# Optional RcppParallel runtime
+RCPPARAL_LIBDIR := $(shell "$(RSCRIPT)" -e 'cat(system.file("libs", package="RcppParallel"))' 2>/dev/null)
+RCPPARAL_SO     := $(shell ls "$(RCPPARAL_LIBDIR)/RcppParallel.so" 2>/dev/null)
 ifneq ($(strip $(RCPPARAL_LIBDIR)),)
   LIBS += -Wl,-rpath,"$(RCPPARAL_LIBDIR)"
 endif

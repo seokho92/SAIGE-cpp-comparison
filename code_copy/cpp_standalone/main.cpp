@@ -1340,20 +1340,104 @@ int main(int argc, char** argv) {
       arma::umat loc; arma::vec val; int n_mtx=0;
       load_matrix_market_coo(paths.sparse_grm, loc, val, n_mtx);
 
-      // ===== Step 10: Sparse GRM dimension assert (R lines 2785-2786) =====
-      // load_matrix_market_coo already checks nr == nc (square).
-      // Additionally verify GRM dimension >= model sample count.
-      if (n_mtx < design.n) {
-        std::cerr << "[warning] Sparse GRM dimension (" << n_mtx
-                  << ") is smaller than the number of model samples (" << design.n
-                  << "). Sample intersection will reduce the model size.\n";
-      }
+      // ===== Subset sparse GRM to phenotyped samples =====
+      // The loaded GRM may cover all samples in the cohort (e.g. 488K),
+      // but we only need the subset that overlaps with our phenotyped samples.
+      // Read sparse GRM sample IDs and build GRM-index -> design-index map.
+      {
+        // Read one ID per line from the sparse GRM sample IDs file
+        std::ifstream id_in(paths.sparse_grm_ids);
+        if (!id_in) throw std::runtime_error("Failed to open sparse GRM IDs: " + paths.sparse_grm_ids);
+        std::vector<std::string> grm_ids;
+        grm_ids.reserve(n_mtx);
+        std::string line;
+        while (std::getline(id_in, line)) {
+          // trim whitespace
+          size_t s = line.find_first_not_of(" \t\r\n");
+          size_t e = line.find_last_not_of(" \t\r\n");
+          if (s != std::string::npos) grm_ids.push_back(line.substr(s, e - s + 1));
+        }
+        if ((int)grm_ids.size() != n_mtx) {
+          std::cerr << "[warning] Sparse GRM IDs count (" << grm_ids.size()
+                    << ") differs from GRM dimension (" << n_mtx << ").\n";
+        }
 
-      setupSparseGRM(n_mtx, loc, val);
+        // Build map: design IID -> design index (0-based)
+        std::unordered_map<std::string, int> design_pos;
+        design_pos.reserve(design.n * 2);
+        for (int i = 0; i < design.n; ++i) {
+          design_pos[design.iid[i]] = i;
+        }
+
+        // Build map: GRM 0-based index -> design 0-based index (-1 if not phenotyped)
+        std::vector<int> grm_to_design(n_mtx, -1);
+        int n_overlap = 0;
+        for (int i = 0; i < (int)grm_ids.size(); ++i) {
+          auto it = design_pos.find(grm_ids[i]);
+          if (it != design_pos.end()) {
+            grm_to_design[i] = it->second;
+            ++n_overlap;
+          }
+        }
+        std::cout << "[sparse] GRM samples: " << n_mtx
+                  << ", phenotyped: " << design.n
+                  << ", overlap: " << n_overlap << "\n";
+        if (n_overlap == 0) {
+          throw std::runtime_error("No overlap between sparse GRM sample IDs and phenotyped samples. "
+                                   "Check that sparse_grm_ids file contains matching sample IDs.");
+        }
+
+        // Filter COO entries: keep only entries where both row and col are phenotyped
+        int total_nnz = (int)val.n_elem;
+        std::vector<arma::uword> new_rows, new_cols;
+        std::vector<double> new_vals;
+        new_rows.reserve(total_nnz);
+        new_cols.reserve(total_nnz);
+        new_vals.reserve(total_nnz);
+
+        for (int k = 0; k < total_nnz; ++k) {
+          int r_old = (int)loc(0, k);
+          int c_old = (int)loc(1, k);
+          if (r_old < n_mtx && c_old < n_mtx &&
+              grm_to_design[r_old] >= 0 && grm_to_design[c_old] >= 0) {
+            new_rows.push_back((arma::uword)grm_to_design[r_old]);
+            new_cols.push_back((arma::uword)grm_to_design[c_old]);
+            new_vals.push_back(val(k));
+          }
+        }
+
+        // Check that all phenotyped samples have a diagonal entry
+        std::vector<bool> has_diag(design.n, false);
+        for (size_t k = 0; k < new_rows.size(); ++k) {
+          if (new_rows[k] == new_cols[k]) has_diag[new_rows[k]] = true;
+        }
+        for (int i = 0; i < design.n; ++i) {
+          if (!has_diag[i]) {
+            // Add identity diagonal for samples with no GRM entry
+            new_rows.push_back((arma::uword)i);
+            new_cols.push_back((arma::uword)i);
+            new_vals.push_back(1.0);
+          }
+        }
+
+        int sub_nnz = (int)new_rows.size();
+        arma::umat sub_loc(2, sub_nnz);
+        arma::vec sub_val(sub_nnz);
+        for (int k = 0; k < sub_nnz; ++k) {
+          sub_loc(0, k) = new_rows[k];
+          sub_loc(1, k) = new_cols[k];
+          sub_val(k) = new_vals[k];
+        }
+
+        std::cout << "[sparse] Subsetted GRM: " << design.n << "x" << design.n
+                  << "  nnz=" << sub_nnz << " (from " << total_nnz << ")\n";
+
+        setupSparseGRM(design.n, sub_loc, sub_val);
+      }
       setisUseSparseSigmaforInitTau(true);
       setisUseSparseSigmaforNullModelFitting(true);
       std::cout << "[sparse] Reusing GRM: " << paths.sparse_grm
-                << "  n=" << n_mtx << "  nnz=" << val.n_elem << "\n";
+                << "  n=" << design.n << "\n";
     } else {
       double rc = (cfg.relatedness_cutoff > 0.0 ? cfg.relatedness_cutoff : 0.05);
       build_sparse_grm_in_place(rc, cfg.min_maf_grm, cfg.max_miss_grm);
